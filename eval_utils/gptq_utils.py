@@ -307,10 +307,10 @@ def gptq_fwrd(model, dataloader, dev, args):
     return quantizers
 
 
-@torch.no_grad()
 def lords_fwrd(model, dev, args, custom_layers=None):
     """
     LoRDS weight quantization: replace block-wise scaling with low-rank decomposed scaling.
+    Note: no @torch.no_grad() here because LoRDS refinement needs gradients.
     """
     from utils.lords_utils import pissaquant_init
 
