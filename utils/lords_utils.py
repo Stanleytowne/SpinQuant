@@ -1,186 +1,231 @@
-# Copyright 2023-present the HuggingFace Inc. team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""
+LoRDS: Low-Rank Decomposed Scaling for LLM Quantization.
 
-# Reference code: https://github.com/yxli2123/LoftQ/blob/main/utils.py
-# Reference paper: https://arxiv.org/abs/2310.08659
+Standalone module with no llmc framework dependencies.
+Replaces block-wise quantization scaling with low-rank per-element scaling:
+    W ≈ (B @ A) ⊙ Q
+where B (m, r), A (r, n) parameterize the scaling matrix S = B @ A,
+and Q (m, n) contains INT4 quantized values from a lookup table.
+"""
 
-from __future__ import annotations
-
-import logging
-import os
-from typing import Callable, Optional, Union
+from typing import Literal, Tuple
 
 import torch
 
-_normal_map = {}
+try:
+    from loguru import logger
+except ImportError:
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
 
-def _get_normal_map(num_bits=2):
-    global _normal_map
-    if num_bits not in _normal_map:
-        _normal_map[num_bits] = create_normal_map(num_bits)
-    return _normal_map[num_bits]
 
-def create_normal_map(num_bits=2, offset=0.9677083):
-    try:
-        from scipy.stats import norm
-    except ImportError:
-        raise ImportError("The required package 'scipy' is not installed. Please install it to continue.")
+def get_int4_lut(device: str = 'cuda') -> torch.Tensor:
+    """Return INT4 signed lookup table: [-8, -7, ..., 7], shape (16,)."""
+    return torch.arange(-8, 8, dtype=torch.float32, device=device)
 
-    variations = 2**num_bits
-    # one more positive value, this is an asymmetric type
-    v1 = norm.ppf(torch.linspace(offset, 0.5, variations // 2 + 1)[:-1]).tolist()
-    v2 = [0]
-    v3 = (-norm.ppf(torch.linspace(offset, 0.5, variations // 2)[:-1])).tolist()
-    v = v1 + v2 + v3
 
-    values = torch.Tensor(v)
-    values = values.sort().values
-    values /= values.max()
-    return values
-
-def _low_rank_decomposition(weight, reduced_rank=32):
+def calculate_equivalent_rank(m: int, n: int, block_size: int) -> int:
     """
-    :param weight: The matrix to decompose, of shape (H, W) :param reduced_rank: the final rank :return:
+    Compute rank r such that low-rank params (m*r + r*n) equals
+    block-wise scale params (m*n / block_size).
+
+    r = (m * n) // (block_size * (m + n))
     """
-    matrix_dimension = len(weight.size())
-    if matrix_dimension != 2:
-        raise ValueError(f"Only support 2D matrix, but your input has {matrix_dimension} dimensions.")
-
-    # Use SVD to decompose a matrix, default full_matrices is False to save parameters
-    U, S, Vh = torch.linalg.svd(weight, full_matrices=False)
-
-    U = U[:, : reduced_rank]
-    Vh = Vh[: reduced_rank, :]
-    S = S[: reduced_rank]
-
-    B = U @ torch.sqrt(torch.diag(S))
-    A = torch.sqrt(torch.diag(S)) @ Vh
-
-    return B, A
-
-def pissaquant_init_from_absmax(weight, rank, abs_w_init):
-    if abs_w_init:
-        print("using abs w init")
-        return _low_rank_decomposition(torch.abs(weight), rank)
+    return (m * n) // (block_size * (m + n))
 
 
-    block_size = weight.shape[1] // rank
-    while weight.shape[1] % block_size:
-        block_size -= 1
-    assert block_size > 0, f"block_size must be greater than 0, got {block_size}"
+def lords_init_BA(
+    W: torch.Tensor,
+    r: int,
+    init: Literal['W', 'scale'] = 'W',
+    block_size: int = 128,
+    scale_matrix: torch.Tensor = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Initialize B (m, r) and A (r, n) via truncated SVD.
 
-    weight_blocks = weight.view(weight.shape[0], -1, block_size)
-    absmax = weight_blocks.abs().max(dim=-1)[0]
-    absmax_expanded = absmax.repeat_interleave(block_size, dim=-1)
-    absmax_expanded = absmax_expanded.reshape((weight.shape[0], weight.shape[1]))
+    Args:
+        W: Weight matrix, shape (m, n).
+        r: Target rank.
+        init: Initialization strategy.
+            - "W": SVD of |W|.
+            - "scale": Compute per-group absmax scales, expand to (m, n), then SVD.
+            - "lwc": Use pre-computed LWC-optimized scale matrix (pass via scale_matrix).
+        block_size: Group size for "scale" initialization.
+        scale_matrix: Pre-computed per-element scale matrix, shape (m, n).
+            Required when init="lwc".
 
-    return _low_rank_decomposition(absmax_expanded, rank)
+    Returns:
+        (B, A) as float32 tensors.
+    """
+    m, n = W.shape
+    device = W.device
 
-def get_qweight_with_AB(weight, B, A, norm_lookup_table):
-    scale = B @ A
-    scale = torch.clamp(scale, min=1e-8)
-    assert weight.shape == scale.shape, f"Weight and scale shapes do not match: {weight.shape} != {scale.shape}"
-    
-    weight_divabs = weight / scale  # (L, B)
-    weight_divabs = weight_divabs.unsqueeze(-1)  # (L, B, 1)
-    L_reshaped = norm_lookup_table.reshape(1, -1)  # (1, 2**K)
+    if init == 'W':
+        target = torch.abs(W).float()
+    elif init == 'scale':
+        # Compute per-group absmax without bitsandbytes
+        W_flat = W.float().reshape(-1, block_size)
+        absmax = W_flat.abs().amax(dim=-1, keepdim=True)  # (num_groups, 1)
+        scale = absmax.repeat(1, block_size).reshape(m, n)  # (m, n)
+        target = scale
+    elif init == 'lwc':
+        assert scale_matrix is not None, "scale_matrix required for init='lwc'"
+        target = scale_matrix.float()
+    else:
+        raise ValueError(f"Unknown init method: {init}")
 
-    abs_diff = torch.abs(weight_divabs - L_reshaped)  # (L, B, 2**K)
-    qweight_idx = torch.argmin(abs_diff, dim=-1)  # (L, B)
-    qweight = norm_lookup_table[qweight_idx]  # (L, B)
+    U, S, Vh = torch.linalg.svd(target, full_matrices=False)
+    U_r = U[:, :r]
+    S_r = torch.diag(S[:r])
+    Vh_r = Vh[:r, :]
+    sqrt_S = torch.sqrt(S_r)
 
-    return qweight
+    B = (U_r @ sqrt_S).to(torch.float32)
+    A = (sqrt_S @ Vh_r).to(torch.float32)
+    return B.to(device), A.to(device)
 
-def refine_ab(
-    w_fp32: torch.Tensor,
-    B: torch.Tensor,
-    A: torch.Tensor,
-    bits: int,
-    eps: float = 1e-8,
-    steps: int = 2000,
-    lr: float = 1e-2,
+
+def lords_find_best_Q(
+    W: torch.Tensor,
+    S: torch.Tensor,
+    lut: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Given scaling matrix S, find optimal Q for each element.
+
+    Q_ij = argmin_q (S_ij * q - W_ij)^2
+
+    Args:
+        W: Original weight matrix, shape (m, n).
+        S: Scaling matrix (B @ A), shape (m, n).
+        lut: Lookup table, shape (num_levels,).
+
+    Returns:
+        Q: Quantized values from lut, shape (m, n).
+    """
+    W_exp = W.unsqueeze(-1)           # (m, n, 1)
+    S_exp = S.unsqueeze(-1)           # (m, n, 1)
+    lut_exp = lut.view(1, 1, -1)      # (1, 1, num_levels)
+
+    recons_cands = S_exp * lut_exp    # (m, n, num_levels)
+    dists = (recons_cands - W_exp).pow(2)
+    min_indices = torch.argmin(dists, dim=-1)
+    return lut[min_indices]
+
+
+@torch.no_grad()
+def quantize_lords(
+    W: torch.Tensor,
+    rank: int,
+    lut: torch.Tensor,
+    steps: int = 50,
+    lr: float = 1e-3,
+    init: Literal['W', 'scale', 'lwc'] = 'W',
+    block_size: int = 128,
     patience: int = 20,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    min_improvement: float = 1e-6,
+    log_interval: int = 10,
+    scale_matrix: torch.Tensor = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Iteratively refine A/B to reduce quantization error.
-    Returns the best (lowest loss) B, A, qweight found during training.
+    LoRDS alternating optimization: W ≈ (B @ A) ⊙ Q.
+
+    Args:
+        W: Weight matrix, shape (m, n), any dtype.
+        rank: Low-rank dimension r.
+        lut: INT4 lookup table, shape (16,).
+        steps: Maximum number of alternating optimization steps.
+        lr: Learning rate for B, A optimization.
+        init: Initialization method ("W", "scale", or "lwc").
+        block_size: Group size for "scale" init and equivalent rank calculation.
+        patience: Early stopping patience. Stop if no improvement for this many steps.
+        min_improvement: Minimum relative improvement to reset patience counter.
+        log_interval: Log every N steps.
+        scale_matrix: Pre-computed per-element scale matrix for init="lwc".
+
+    Returns:
+        (W_hat, B, A) where W_hat = (B @ A) * Q is the fake-quantized weight.
     """
-    device = w_fp32.device
-    B = B.to(device=device, dtype=torch.float32).detach().requires_grad_(True)
-    A = A.to(device=device, dtype=torch.float32).detach().requires_grad_(True)
-    optimizer = torch.optim.Adam([B, A], lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
+    W = W.float()
+    m, n = W.shape
+    device = W.device
 
-    norm_lookup_table = _get_normal_map(bits).to(device)
+    # Initialize B, A
+    B, A = lords_init_BA(W, rank, init=init, block_size=block_size,
+                         scale_matrix=scale_matrix)
+    B = B.clone().detach().requires_grad_(True)
+    A = A.clone().detach().requires_grad_(True)
 
-    best_loss = float("inf")
-    best_B = B.detach().clone()
-    best_A = A.detach().clone()
-    best_qweight = None
-    steps_without_improvement = 0
+    optimizer = torch.optim.AdamW([B, A], lr=lr)
 
-    for step in range(steps):
-        with torch.no_grad():
-            qweight = get_qweight_with_AB(w_fp32, B, A, norm_lookup_table)
+    # Initial Q
+    with torch.no_grad():
+        S = B @ A
+        Q = lords_find_best_Q(W, S, lut)
 
-        optimizer.zero_grad(set_to_none=True)
-        scale = torch.clamp(B @ A, min=eps)
-        w_hat = qweight * scale
-        loss = torch.linalg.norm(w_hat - w_fp32)
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
+    # Early stopping state
+    best_loss = float('inf')
+    no_improve_count = 0
+    actual_steps = 0
 
-        cur_loss = loss.item()
-        if cur_loss < best_loss:
-            best_loss = cur_loss
-            best_B = B.detach().clone()
-            best_A = A.detach().clone()
-            best_qweight = qweight.detach().clone()
-            steps_without_improvement = 0
-        else:
-            steps_without_improvement += 1
+    with torch.enable_grad():
+        for step in range(steps):
+            # Step A: Fix B, A → update Q
+            with torch.no_grad():
+                S = B @ A
+                Q = lords_find_best_Q(W, S, lut)
 
-        if step % 100 == 0:
-            print(f"Refine AB: Step {step} loss: {cur_loss:.6f} (best: {best_loss:.6f})")
+            # Step B: Fix Q → optimize B, A
+            optimizer.zero_grad()
+            S = B @ A
+            W_hat = S * Q
+            loss = torch.mean((W_hat - W) ** 2)
+            loss.backward()
+            optimizer.step()
 
-        if steps_without_improvement >= patience:
-            print(f"Early stopping at step {step}, no improvement for {patience} steps (best loss: {best_loss:.6f})")
-            break
+            current_loss = loss.item()
+            actual_steps = step + 1
 
-    return best_B, best_A, best_qweight
+            # Logging
+            if step % log_interval == 0 or step == steps - 1:
+                logger.info(
+                    f'  LoRDS step {step:>4d}/{steps}, '
+                    f'loss={current_loss:.6e}, '
+                    f'best={best_loss:.6e}, '
+                    f'no_improve={no_improve_count}/{patience}'
+                )
 
+            # Early stopping check
+            if best_loss == float('inf'):
+                relative_improvement = float('inf')
+            else:
+                relative_improvement = (best_loss - current_loss) / max(best_loss, 1e-10)
+            if current_loss < best_loss and relative_improvement > min_improvement:
+                best_loss = current_loss
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
 
+            if no_improve_count >= patience:
+                logger.info(
+                    f'  LoRDS early stop at step {step}, '
+                    f'no improvement for {patience} steps'
+                )
+                break
 
-def pissaquant_init(weight: Union[torch.Tensor, torch.nn.Parameter], num_bits: int, reduced_rank: int, steps: int, lr: float = 1e-2, apply_quantization: bool = True, abs_w_init: bool = False):
+    # Final reconstruction
+    with torch.no_grad():
+        S = B @ A
+        Q = lords_find_best_Q(W, S, lut)
+        W_hat = S * Q
+        final_loss = torch.mean((W_hat - W) ** 2).item()
 
-    if num_bits not in [2, 4, 8]:
-        raise ValueError("Only support 2, 4, 8 bits quantization")
-
-    out_feature, in_feature = weight.size()
-    device = weight.device
-    dtype = weight.dtype
-
-    print(
-        f"Weight: ({out_feature}, {in_feature}) | Rank: {reduced_rank} | Num Bits: {num_bits}"
+    logger.info(
+        f'  LoRDS done: shape=({m},{n}), rank={rank}, '
+        f'steps={actual_steps}/{steps}, '
+        f'final_loss={final_loss:.6e}'
     )
 
-    w_fp32 = weight.to(dtype=torch.float32)
-    
-    B, A = pissaquant_init_from_absmax(w_fp32, reduced_rank, abs_w_init)
-
-    B, A, qweight = refine_ab(w_fp32, B, A, num_bits, steps=steps, lr=lr)
-
-    new_weight = qweight
-    return new_weight.to(device=device, dtype=dtype) * ( B.to(device) @ A.to(device))
+    return W_hat, B.detach(), A.detach()

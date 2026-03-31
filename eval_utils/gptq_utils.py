@@ -310,9 +310,9 @@ def gptq_fwrd(model, dataloader, dev, args):
 def lords_fwrd(model, dev, args, custom_layers=None):
     """
     LoRDS weight quantization: replace block-wise scaling with low-rank decomposed scaling.
-    Note: no @torch.no_grad() here because LoRDS refinement needs gradients.
+    Uses INT4 lookup table and the paper's official quantize_lords() implementation.
     """
-    from utils.lords_utils import pissaquant_init
+    from utils.lords_utils import quantize_lords, get_int4_lut, calculate_equivalent_rank
 
     if custom_layers:
         layers = custom_layers
@@ -322,6 +322,7 @@ def lords_fwrd(model, dev, args, custom_layers=None):
 
     quantizers = {}
     blocksize = args.w_groupsize if args.w_groupsize > 0 else 128
+    lut = get_int4_lut(device=dev)
 
     for i in tqdm.tqdm(range(len(layers)), desc="(LoRDS Quant.) Layers"):
         layer = layers[i].to(dev)
@@ -331,27 +332,27 @@ def lords_fwrd(model, dev, args, custom_layers=None):
         )
 
         for name in subset:
-            layer_weight_bits = args.w_bits
             if "lm_head" in name:
                 continue
             if args.int8_down_proj and "down_proj" in name:
-                layer_weight_bits = 8
+                continue  # skip 8-bit layers for now
 
             W = subset[name].weight.data.float()
-            reduce_rank = (W.shape[0] * W.shape[1] // blocksize) // (W.shape[0] + W.shape[1])
-            reduce_rank = max(reduce_rank, 1)
+            m, n = W.shape
+            rank = calculate_equivalent_rank(m, n, blocksize)
+            rank = max(rank, 1)
 
-            W_lords = pissaquant_init(
+            W_hat, B, A = quantize_lords(
                 W,
-                num_bits=layer_weight_bits,
-                reduced_rank=reduce_rank,
+                rank=rank,
+                lut=lut,
                 steps=args.lords_steps,
                 lr=args.lords_lr,
-                apply_quantization=True,
-                abs_w_init=False,
+                init='scale',
+                block_size=blocksize,
+                patience=20,
             )
-            subset[name].weight.data = W_lords.to(next(iter(layer.parameters())).dtype)
-            print(f"  Layer {i} {name}: rank={reduce_rank}, bits={layer_weight_bits}")
+            subset[name].weight.data = W_hat.to(next(iter(layer.parameters())).dtype)
 
         layers[i] = layer.cpu()
         torch.cuda.empty_cache()
