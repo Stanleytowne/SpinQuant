@@ -4,7 +4,7 @@
 # Example: bash scripts/eval_spinquant_lords.sh /data2/mengfanxu/huggingface/Meta-Llama-3-8B 4 8 16
 #          bash scripts/eval_spinquant_lords.sh /data2/mengfanxu/huggingface/Meta-Llama-3-8B 4 4 4
 
-torchrun --nnodes=1 --nproc_per_node=1 ptq.py \
+torchrun --nnodes=1 --nproc_per_node=1 --master_port=${MASTER_PORT:-29500} ptq.py \
 --input_model $1 \
 --do_train False \
 --do_eval True \
