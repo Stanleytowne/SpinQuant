@@ -339,7 +339,9 @@ def lords_fwrd(model, dev, args, custom_layers=None):
 
             W = subset[name].weight.data.float()
             m, n = W.shape
-            rank = calculate_equivalent_rank(m, n, blocksize)
+            # Use n/blocksize so SVD can exactly represent block-wise scaling
+            # (sanity check: LoRDS should be >= RTN from this starting point)
+            rank = n // blocksize
             rank = max(rank, 1)
 
             W_hat, B, A = quantize_lords(
