@@ -344,6 +344,17 @@ def lords_fwrd(model, dev, args, custom_layers=None):
             rank = n // blocksize
             rank = max(rank, 1)
 
+            # RTN baseline MSE for comparison
+            rtn_quantizer = quant_utils.WeightQuantizer()
+            rtn_quantizer.configure(
+                args.w_bits, perchannel=True,
+                sym=not (args.w_asym), mse=args.w_clip,
+                weight_groupsize=blocksize,
+            )
+            rtn_quantizer.find_params(W)
+            W_rtn, _, _ = rtn_quantizer.fake_quantize(W)
+            rtn_mse = torch.mean((W_rtn - W) ** 2).item()
+
             W_hat, B, A = quantize_lords(
                 W,
                 rank=rank,
@@ -354,7 +365,15 @@ def lords_fwrd(model, dev, args, custom_layers=None):
                 block_size=blocksize,
                 patience=20,
             )
+            lords_mse = torch.mean((W_hat - W) ** 2).item()
+
+            improvement = (rtn_mse - lords_mse) / rtn_mse * 100
+            print(f"  Layer {i} {name}: shape=({m},{n}) rank={rank} "
+                  f"RTN_MSE={rtn_mse:.6e} LoRDS_MSE={lords_mse:.6e} "
+                  f"improvement={improvement:+.2f}%")
+
             subset[name].weight.data = W_hat.to(next(iter(layer.parameters())).dtype)
+            del W_rtn, rtn_quantizer
 
         layers[i] = layer.cpu()
         torch.cuda.empty_cache()
