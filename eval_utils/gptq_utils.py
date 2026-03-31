@@ -312,7 +312,7 @@ def lords_fwrd(model, dev, args, custom_layers=None):
     LoRDS weight quantization: replace block-wise scaling with low-rank decomposed scaling.
     Uses INT4 lookup table and the paper's official quantize_lords() implementation.
     """
-    from utils.lords_utils import quantize_lords, get_int4_lut, calculate_equivalent_rank
+    from utils.lords_utils import quantize_lords, get_int_lut, calculate_equivalent_rank
 
     if custom_layers:
         layers = custom_layers
@@ -322,7 +322,8 @@ def lords_fwrd(model, dev, args, custom_layers=None):
 
     quantizers = {}
     blocksize = args.w_groupsize if args.w_groupsize > 0 else 128
-    lut = get_int4_lut(device=dev)
+    lut = get_int_lut(bits=args.w_bits, device=dev)
+    print(f"[LoRDS] Using {args.w_bits}-bit LUT with {len(lut)} levels: [{lut[0].item():.0f}, ..., {lut[-1].item():.0f}]")
 
     for i in tqdm.tqdm(range(len(layers)), desc="(LoRDS Quant.) Layers"):
         layer = layers[i].to(dev)

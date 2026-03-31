@@ -25,6 +25,16 @@ def get_int4_lut(device: str = 'cuda') -> torch.Tensor:
     return torch.arange(-8, 8, dtype=torch.float32, device=device)
 
 
+def get_int_lut(bits: int, device: str = 'cuda') -> torch.Tensor:
+    """Return signed integer lookup table for arbitrary bit-width.
+    bits=4: [-8, -7, ..., 7] (16 levels)
+    bits=3: [-4, -3, ..., 3] (8 levels)
+    bits=2: [-2, -1, 0, 1] (4 levels)
+    """
+    n = 2 ** (bits - 1)
+    return torch.arange(-n, n, dtype=torch.float32, device=device)
+
+
 def calculate_equivalent_rank(m: int, n: int, block_size: int) -> int:
     """
     Compute rank r such that low-rank params (m*r + r*n) equals
