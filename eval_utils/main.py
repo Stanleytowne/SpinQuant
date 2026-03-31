@@ -54,6 +54,9 @@ def ptq_model(args, model, model_args=None):
             save_dict = torch.load(args.load_qmodel_path)
             model.load_state_dict(save_dict["model"])
 
+        elif args.w_lords:  # LoRDS Weight Quantization
+            quantizers = gptq_utils.lords_fwrd(model, "cuda", args)
+            save_dict["w_quantizers"] = quantizers
         elif not args.w_rtn:  # GPTQ Weight Quantization
             trainloader = data_utils.get_wikitext2(
                 nsamples=args.nsamples,

@@ -308,6 +308,60 @@ def gptq_fwrd(model, dataloader, dev, args):
 
 
 @torch.no_grad()
+def lords_fwrd(model, dev, args, custom_layers=None):
+    """
+    LoRDS weight quantization: replace block-wise scaling with low-rank decomposed scaling.
+    """
+    from utils.lords_utils import pissaquant_init
+
+    if custom_layers:
+        layers = custom_layers
+    else:
+        layers = model.model.layers
+    torch.cuda.empty_cache()
+
+    quantizers = {}
+    blocksize = args.w_groupsize if args.w_groupsize > 0 else 128
+
+    for i in tqdm.tqdm(range(len(layers)), desc="(LoRDS Quant.) Layers"):
+        layer = layers[i].to(dev)
+
+        subset = quant_utils.find_qlayers(
+            layer, layers=[torch.nn.Linear, torch.nn.Embedding]
+        )
+
+        for name in subset:
+            layer_weight_bits = args.w_bits
+            if "lm_head" in name:
+                continue
+            if args.int8_down_proj and "down_proj" in name:
+                layer_weight_bits = 8
+
+            W = subset[name].weight.data.float()
+            reduce_rank = (W.shape[0] * W.shape[1] // blocksize) // (W.shape[0] + W.shape[1])
+            reduce_rank = max(reduce_rank, 1)
+
+            W_lords = pissaquant_init(
+                W,
+                num_bits=layer_weight_bits,
+                reduced_rank=reduce_rank,
+                steps=args.lords_steps,
+                lr=args.lords_lr,
+                apply_quantization=True,
+                abs_w_init=False,
+            )
+            subset[name].weight.data = W_lords.to(next(iter(layer.parameters())).dtype)
+            print(f"  Layer {i} {name}: rank={reduce_rank}, bits={layer_weight_bits}")
+
+        layers[i] = layer.cpu()
+        torch.cuda.empty_cache()
+        del layer
+
+    utils.cleanup_memory(verbos=True)
+    return quantizers
+
+
+@torch.no_grad()
 def rtn_fwrd(model, dev, args, custom_layers=None):
     """
     From GPTQ repo

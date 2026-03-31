@@ -129,6 +129,24 @@ def parser_gen():
         help="Quantize the weights using RtN. If the w_bits < 16 and this flag is not set, we use GPTQ",
     )
     parser.add_argument(
+        "--w_lords",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Quantize the weights using LoRDS (low-rank decomposed scaling).",
+    )
+    parser.add_argument(
+        "--lords_steps",
+        type=int,
+        default=500,
+        help="Number of optimization steps for LoRDS refinement.",
+    )
+    parser.add_argument(
+        "--lords_lr",
+        type=float,
+        default=1e-2,
+        help="Learning rate for LoRDS refinement.",
+    )
+    parser.add_argument(
         "--w_clip",
         action=argparse.BooleanOptionalAction,
         default=False,
